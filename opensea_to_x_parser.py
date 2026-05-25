@@ -943,17 +943,19 @@ def open_item_and_get_owner_url(opensea_page, item_url):
     return owner_href
 
 
-def open_owner_and_get_twitter(opensea_page, owner_url):
+def open_owner_and_get_details(opensea_page, owner_url):
     """
-    Открывает профиль owner'а. Возвращает (twitter_handle, opensea_id).
-    twitter_handle = "" если ссылки нет.
-    opensea_id = username или 0x-кошелёк из URL.
+    Открывает профиль owner'а. Возвращает (twitter_handle, opensea_id, wallet).
+      twitter_handle = "" если ссылки нет на opensea профиле.
+      opensea_id     = username или 0x-кошелёк из URL.
+      wallet         = 0x... (40 hex), пустая строка если на странице не нашли.
+                       Если opensea_id уже кошелёк — wallet = opensea_id.
     """
     try:
         opensea_page.goto(owner_url, wait_until="domcontentloaded", timeout=60000)
     except Exception as e:
         print(f"⚠️ Не могу открыть owner {owner_url}: {e}")
-        return "", ""
+        return "", "", ""
     sleep_random(OPENSEA_DELAY_MIN, OPENSEA_DELAY_MAX)
 
     # opensea_id из URL
@@ -961,8 +963,9 @@ def open_owner_and_get_twitter(opensea_page, owner_url):
     opensea_id = parsed.path.strip("/").split("/")[0].lower()
     if not opensea_id or opensea_id in BAD_OPENSEA_PATHS:
         print(f"⚠️ После goto URL не похож на профиль: {opensea_page.url}")
-        return "", ""
+        return "", "", ""
 
+    # twitter link
     twitter_handle = ""
     try:
         x_links = opensea_page.eval_on_selector_all(
@@ -981,7 +984,32 @@ def open_owner_and_get_twitter(opensea_page, owner_url):
             twitter_handle = handle
             break
 
-    return twitter_handle, opensea_id
+    # wallet: если opensea_id это кошелёк — уже есть, иначе ищем на странице
+    wallet = opensea_id if is_wallet(opensea_id) else ""
+
+    if not wallet:
+        try:
+            # Источники: hrefs (etherscan/blockscan), aria-label, текст body
+            page_data = opensea_page.evaluate(
+                """
+                () => {
+                    const parts = [];
+                    const anchors = Array.from(document.querySelectorAll('a[href]'));
+                    for (const a of anchors) parts.push(a.getAttribute('href') || '');
+                    const ariaEls = Array.from(document.querySelectorAll('[aria-label]'));
+                    for (const e of ariaEls) parts.push(e.getAttribute('aria-label') || '');
+                    parts.push(document.body.innerText || '');
+                    return parts.join(' ');
+                }
+                """
+            )
+        except Exception:
+            page_data = ""
+        m = re.search(r"0x[a-fA-F0-9]{40}", page_data or "")
+        if m:
+            wallet = m.group(0).lower()
+
+    return twitter_handle, opensea_id, wallet
 
 
 # ==================== X PAGE LOAD WITH RETRY ====================
@@ -1198,72 +1226,38 @@ def x_search_top_latest(x_page_ref, query, rotate_fn):
 
 # ==================== FALLBACK SEARCH LOGIC ====================
 
-def fallback_find_twitter(x_page_ref, opensea_id, rotate_fn,
-                          collection_url, opensea_owner_url):
+def search_twitter_by_wallet(x_page_ref, wallet, rotate_fn,
+                             collection_url, opensea_owner_url, owner_id_for_debug):
     """
-    Ищет твиттер по opensea_id (кошелёк или username):
-      1) Если 0x-кошелёк: People-таб по кошельку -> первый. Если пусто -> Top-таб, автор первого твита.
-      2) Если username: People-таб, только точное совпадение handle == opensea_id.
-    Возвращает handle или "".
+    Ищет твиттер ТОЛЬКО по 0x-кошельку.
+      1) People-таб по wallet -> первый кандидат.
+      2) Если пусто -> Top-таб, автор первого твита.
     Перед возвратом верифицирует что профиль жив.
+    Возвращает handle или "".
     """
-    is_wallet_id = is_wallet(opensea_id)
+    if not is_wallet(wallet):
+        return ""
 
-    if is_wallet_id:
-        people = x_search_people(x_page_ref, opensea_id, rotate_fn)
-        candidate = ""
-        if people:
-            candidate = people[0]
-            print(f"   People-таб → @{candidate}")
-        else:
-            print("   People-таб пуст, пробую Top-таб...")
-            candidate = x_search_top_latest(x_page_ref, opensea_id, rotate_fn)
-            if candidate:
-                print(f"   Top-таб → @{candidate}")
-
-        if not candidate or is_bad_handle(candidate):
-            add_debug(
-                collection_url=collection_url,
-                opensea_owner_url=opensea_owner_url,
-                owner_id=opensea_id,
-                x_source_url=f"https://x.com/search?q={opensea_id}",
-                result_type="wallet_search_no_match",
-                saved_profile="",
-                reason="wallet search returned no usable handle",
-            )
-            return ""
-
-        if not verify_x_profile_alive(x_page_ref, candidate, rotate_fn):
-            add_debug(
-                collection_url=collection_url,
-                opensea_owner_url=opensea_owner_url,
-                owner_id=opensea_id,
-                x_source_url=f"https://x.com/{candidate}",
-                result_type="wallet_search_candidate_dead",
-                saved_profile="",
-                reason=f"candidate @{candidate} suspended/dead",
-            )
-            return ""
-        return candidate
-
-    # username
-    people = x_search_people(x_page_ref, opensea_id, rotate_fn)
+    people = x_search_people(x_page_ref, wallet, rotate_fn)
     candidate = ""
-    target = opensea_id.lower()
-    for h in people:
-        if h.lower() == target:
-            candidate = h
-            break
+    if people:
+        candidate = people[0]
+        print(f"   People-таб → @{candidate}")
+    else:
+        print("   People-таб пуст, пробую Top-таб...")
+        candidate = x_search_top_latest(x_page_ref, wallet, rotate_fn)
+        if candidate:
+            print(f"   Top-таб → @{candidate}")
 
-    if not candidate:
+    if not candidate or is_bad_handle(candidate):
         add_debug(
             collection_url=collection_url,
             opensea_owner_url=opensea_owner_url,
-            owner_id=opensea_id,
-            x_source_url=f"https://x.com/search?q={opensea_id}&f=user",
-            result_type="username_search_no_exact_match",
+            owner_id=owner_id_for_debug,
+            x_source_url=f"https://x.com/search?q={wallet}",
+            result_type="wallet_search_no_match",
             saved_profile="",
-            reason=f"no exact handle match for opensea username {opensea_id}",
+            reason=f"wallet {wallet} search returned no usable handle",
         )
         return ""
 
@@ -1271,9 +1265,9 @@ def fallback_find_twitter(x_page_ref, opensea_id, rotate_fn,
         add_debug(
             collection_url=collection_url,
             opensea_owner_url=opensea_owner_url,
-            owner_id=opensea_id,
+            owner_id=owner_id_for_debug,
             x_source_url=f"https://x.com/{candidate}",
-            result_type="username_search_candidate_dead",
+            result_type="wallet_search_candidate_dead",
             saved_profile="",
             reason=f"candidate @{candidate} suspended/dead",
         )
@@ -1289,12 +1283,14 @@ def process_owner(
     collection_url,
     opensea_owner_url,
     opensea_id,
+    opensea_wallet,
     twitter_handle_from_opensea,
     processed_owners,
     processed_twitter,
 ):
     """
-    Принимает owner_url, opensea_id, twitter_handle (может быть пустым).
+    Принимает owner_url, opensea_id, opensea_wallet, twitter_handle (может быть пустым).
+    Если twitter не указан в OpenSea — ищет ТОЛЬКО по 0x-кошельку.
     Возвращает True если сохранили новый профиль.
     """
     if opensea_id in processed_owners:
@@ -1314,23 +1310,50 @@ def process_owner(
         if alive:
             saved_handle = twitter_handle_from_opensea
         else:
-            print(f"💀 @{twitter_handle_from_opensea} suspended/dead. Fallback на поиск по {opensea_id}")
+            print(f"💀 @{twitter_handle_from_opensea} suspended/dead.")
+            if is_wallet(opensea_wallet):
+                print(f"   → fallback поиск по кошельку {opensea_wallet}")
+                try:
+                    saved_handle = search_twitter_by_wallet(
+                        x_page_ref, opensea_wallet, rotate_fn,
+                        collection_url, opensea_owner_url, opensea_id,
+                    )
+                except RateLimitError:
+                    raise
+            else:
+                print(f"   ⏭️ кошелька нет — пропускаю owner {opensea_id}")
+                add_debug(
+                    collection_url=collection_url,
+                    opensea_owner_url=opensea_owner_url,
+                    owner_id=opensea_id,
+                    x_source_url="",
+                    result_type="no_wallet_for_search",
+                    saved_profile="",
+                    reason="opensea twitter dead and no 0x wallet available",
+                )
+                return False
+    else:
+        if is_wallet(opensea_wallet):
+            print(f"🐦 У OpenSea профиля {opensea_id} нет твиттера → поиск по кошельку {opensea_wallet}")
             try:
-                saved_handle = fallback_find_twitter(
-                    x_page_ref, opensea_id, rotate_fn,
-                    collection_url, opensea_owner_url,
+                saved_handle = search_twitter_by_wallet(
+                    x_page_ref, opensea_wallet, rotate_fn,
+                    collection_url, opensea_owner_url, opensea_id,
                 )
             except RateLimitError:
                 raise
-    else:
-        print(f"🐦 У OpenSea профиля {opensea_id} нет твиттера → поиск")
-        try:
-            saved_handle = fallback_find_twitter(
-                x_page_ref, opensea_id, rotate_fn,
-                collection_url, opensea_owner_url,
+        else:
+            print(f"⏭️ Owner {opensea_id}: нет twitter и нет 0x-кошелька — skip")
+            add_debug(
+                collection_url=collection_url,
+                opensea_owner_url=opensea_owner_url,
+                owner_id=opensea_id,
+                x_source_url="",
+                result_type="no_wallet_for_search",
+                saved_profile="",
+                reason="no twitter on opensea and no 0x wallet available",
             )
-        except RateLimitError:
-            raise
+            return False
 
     if not saved_handle:
         add_debug(
@@ -1340,7 +1363,7 @@ def process_owner(
             x_source_url="",
             result_type="no_twitter_found",
             saved_profile="",
-            reason="no twitter on opensea and search returned nothing",
+            reason="wallet search returned nothing",
         )
         return False
 
@@ -1500,7 +1523,7 @@ def process_collection(
                 continue
 
             try:
-                twitter_handle, opensea_id_from_profile = open_owner_and_get_twitter(
+                twitter_handle, opensea_id_from_profile, opensea_wallet = open_owner_and_get_details(
                     opensea_page, owner_href
                 )
             except Exception as e:
@@ -1512,6 +1535,9 @@ def process_collection(
                 if opensea_id_from_profile
                 else opensea_id_norm
             )
+
+            if not opensea_wallet and is_wallet(opensea_id_final):
+                opensea_wallet = opensea_id_final.lower()
 
             if (
                 opensea_id_final in processed_owners
@@ -1529,6 +1555,7 @@ def process_collection(
                     collection_url,
                     owner_href,
                     opensea_id_final,
+                    opensea_wallet,
                     twitter_handle,
                     processed_owners,
                     processed_twitter,

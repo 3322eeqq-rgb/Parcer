@@ -85,11 +85,15 @@ BAD_X_HANDLES = {
 
 # Пути / страницы OpenSea, которые НЕ являются профилем owner'а
 BAD_OPENSEA_PATHS = {
-    "collection", "collections", "item", "rankings", "drops", "activity",
-    "explore", "trending", "category", "categories", "studio", "blog",
-    "stats", "membership", "learn", "help", "terms", "privacy", "press",
-    "login", "register", "account", "settings", "watchlist", "portfolio",
-    "create", "assets", "rewards", "search", "ranking",
+    "collection", "collections", "item", "items", "rankings", "ranking",
+    "drops", "drop", "activity", "explore", "trending", "category",
+    "categories", "studio", "blog", "blogs", "stats", "membership", "learn",
+    "help", "terms", "privacy", "press", "login", "register", "account",
+    "settings", "watchlist", "portfolio", "create", "assets", "rewards",
+    "search", "swap", "buy", "sell", "marketplace", "profile", "home",
+    "tos", "about", "trade", "trades", "leaderboard", "leaderboards",
+    "notifications", "messages", "wallet", "wallets", "connect", "discover",
+    "favorites", "studios", "drops-calendar", "drops_calendar",
 }
 
 
@@ -832,6 +836,8 @@ def scroll_collection_grid(opensea_page, strong=False):
 def open_item_and_get_owner_url(opensea_page, item_url):
     """
     Открывает страницу NFT. Возвращает URL owner'а (https://opensea.io/<id>) или "".
+    Ищем элемент с прямым текстом "Owned by" и берём ближайшую СЛЕДУЮЩУЮ
+    ссылку на профиль /<id>, не путая со swap/collection/прочими ссылками в шапке.
     """
     try:
         opensea_page.goto(item_url, wait_until="domcontentloaded", timeout=60000)
@@ -840,36 +846,84 @@ def open_item_and_get_owner_url(opensea_page, item_url):
         return ""
     sleep_random(OPENSEA_DELAY_MIN, OPENSEA_DELAY_MAX)
 
+    bad_paths_js = sorted(BAD_OPENSEA_PATHS)
+
     try:
         owner_href = opensea_page.evaluate(
             """
-            () => {
-                // Ищем "Owned by <handle>" и берём ссылку
-                const body = document.body;
-                const labels = Array.from(body.querySelectorAll('*'))
-                    .filter(el => /owned\\s+by/i.test(el.innerText || '') && el.children.length < 6);
-                for (const lbl of labels) {
-                    const a = lbl.querySelector('a[href^="/"]')
-                        || (lbl.parentElement && lbl.parentElement.querySelector('a[href^="/"]'));
-                    if (a) {
-                        const href = a.getAttribute('href') || '';
-                        if (/^\\/[^/]+$/.test(href)) return href;
+            (badList) => {
+                const bad = new Set(badList);
+
+                function isOwnerHref(href) {
+                    if (!href) return false;
+                    const m = String(href).match(/^\\/([A-Za-z0-9_\\-\\.]+)\\/?$/);
+                    if (!m) return false;
+                    if (bad.has(m[1].toLowerCase())) return false;
+                    return true;
+                }
+
+                // 1) Найти элементы, чей СОБСТВЕННЫЙ (не от детей) текст содержит "Owned by"
+                const all = Array.from(document.body.querySelectorAll('*'));
+                const ownedByEls = [];
+                for (const el of all) {
+                    let direct = '';
+                    for (const node of el.childNodes) {
+                        if (node.nodeType === 3) direct += node.textContent;
+                    }
+                    if (/owned\\s+by/i.test(direct)) {
+                        ownedByEls.push(el);
                     }
                 }
-                // Fallback: первая ссылка вида /<id>, где <id> не из BAD путей
-                const all = Array.from(body.querySelectorAll('a[href]'));
-                for (const a of all) {
-                    const href = a.getAttribute('href') || '';
-                    const m = href.match(/^\\/([A-Za-z0-9_\\-]+)$/);
-                    if (!m) continue;
-                    const first = m[1].toLowerCase();
-                    const bad = ['collection','collections','item','rankings','drops','activity','explore','trending','category','categories','studio','blog','stats','membership','learn','help','terms','privacy','press','login','register','account','settings','watchlist','portfolio','create','assets','rewards','search','ranking','about'];
-                    if (bad.includes(first)) continue;
-                    return href;
+
+                // 2) Для каждого: пробуем найти ссылку профиля среди:
+                //    a) собственных потомков,
+                //    b) следующих sibling'ов,
+                //    c) детей parentElement (но только тех, что идут ПОСЛЕ нашего el).
+                function findOwnerLinkInScope(scope) {
+                    const links = scope.querySelectorAll('a[href]');
+                    for (const a of links) {
+                        const href = a.getAttribute('href');
+                        if (isOwnerHref(href)) return href;
+                    }
+                    return '';
                 }
+
+                for (const el of ownedByEls) {
+                    // a) внутри самого el
+                    let r = findOwnerLinkInScope(el);
+                    if (r) return r;
+
+                    // b) среди следующих sibling'ов
+                    let sib = el.nextElementSibling;
+                    for (let i = 0; i < 6 && sib; i++) {
+                        if (sib.matches && sib.matches('a[href]')) {
+                            const href = sib.getAttribute('href');
+                            if (isOwnerHref(href)) return href;
+                        }
+                        const r2 = findOwnerLinkInScope(sib);
+                        if (r2) return r2;
+                        sib = sib.nextElementSibling;
+                    }
+
+                    // c) дети parentElement, идущие после el
+                    if (el.parentElement) {
+                        const kids = Array.from(el.parentElement.children);
+                        const idx = kids.indexOf(el);
+                        for (let i = idx + 1; i < kids.length && i < idx + 8; i++) {
+                            if (kids[i].matches && kids[i].matches('a[href]')) {
+                                const href = kids[i].getAttribute('href');
+                                if (isOwnerHref(href)) return href;
+                            }
+                            const r3 = findOwnerLinkInScope(kids[i]);
+                            if (r3) return r3;
+                        }
+                    }
+                }
+
                 return '';
             }
-            """
+            """,
+            bad_paths_js,
         )
     except Exception as e:
         print(f"⚠️ Ошибка извлечения owner на {item_url}: {e}")
@@ -879,6 +933,13 @@ def open_item_and_get_owner_url(opensea_page, item_url):
         return ""
     if owner_href.startswith("/"):
         owner_href = "https://opensea.io" + owner_href
+
+    # Защита: проверяем что в финальном URL первый path-сегмент не bad
+    parsed = urlparse(owner_href)
+    first_seg = parsed.path.strip("/").split("/")[0].lower() if parsed.path else ""
+    if not first_seg or first_seg in BAD_OPENSEA_PATHS:
+        return ""
+
     return owner_href
 
 
@@ -898,6 +959,9 @@ def open_owner_and_get_twitter(opensea_page, owner_url):
     # opensea_id из URL
     parsed = urlparse(opensea_page.url)
     opensea_id = parsed.path.strip("/").split("/")[0].lower()
+    if not opensea_id or opensea_id in BAD_OPENSEA_PATHS:
+        print(f"⚠️ После goto URL не похож на профиль: {opensea_page.url}")
+        return "", ""
 
     twitter_handle = ""
     try:

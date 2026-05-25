@@ -65,6 +65,11 @@ ACCOUNT_REST_TIME = 600  # 10 минут
 PAGE_LOAD_WAIT_BEFORE_ROTATE = 30
 MAX_RETRIES_PER_URL = 3
 
+# Жёсткий лимит поисковых запросов на один X аккаунт за одну "смену".
+# По достижении — аккаунт уходит на отдых, переключаемся на следующий.
+# Счётчик сбрасывается, когда аккаунт возвращается с отдыха.
+MAX_SEARCHES_PER_ACCOUNT = 25
+
 # Сохраняем outputs каждые N обработанных owners
 SAVE_OUTPUTS_EVERY = 10
 
@@ -96,6 +101,10 @@ visited_x_urls = set()
 visited_owners_session = set()
 
 stop_requested = False
+
+# Установится в main() после создания AccountManager.
+# Используется search-функциями для трекинга квоты 25 поисков на аккаунт.
+_account_manager = None
 
 
 def request_stop(signum=None, frame=None):
@@ -348,6 +357,7 @@ class AccountManager:
         self.accounts = accounts
         self.rest_until = [0.0] * len(accounts)
         self.rate_limit_count = [0] * len(accounts)
+        self.search_counts = [0] * len(accounts)
         self.current_index = 0
 
     def get_current(self):
@@ -359,11 +369,25 @@ class AccountManager:
         rest_until = time.time() + ACCOUNT_REST_TIME
         self.rest_until[index] = rest_until
         self.rate_limit_count[index] += 1
+        # Сбрасываем счётчик поисков — после отдыха аккаунт начинает свежий цикл
+        self.search_counts[index] = 0
         print(
             f"😴 Аккаунт #{index + 1} отдыхает до "
             f"{time.strftime('%H:%M:%S', time.localtime(rest_until))} "
             f"(~{ACCOUNT_REST_TIME // 60} мин) rate_limit #{self.rate_limit_count[index]}"
         )
+
+    def note_search(self, index=None):
+        if index is None:
+            index = self.current_index
+        self.search_counts[index] += 1
+        return self.search_counts[index]
+
+    def current_search_count(self):
+        return self.search_counts[self.current_index]
+
+    def quota_exhausted(self):
+        return self.search_counts[self.current_index] >= MAX_SEARCHES_PER_ACCOUNT
 
     def next_available(self):
         n = len(self.accounts)
@@ -976,14 +1000,44 @@ def verify_x_profile_alive(x_page_ref, handle, rotate_fn):
 
 # ==================== X: SEARCH ====================
 
+def ensure_search_quota(rotate_fn):
+    """
+    Перед каждым search-запросом проверяем квоту 25 поисков на текущий аккаунт.
+    Если квота исчерпана — ротация (текущий уходит на отдых,
+    его счётчик сбросится при mark_rate_limited).
+    Цикл потому что новый аккаунт тоже может быть с уже использованной квотой
+    в теории (например после возврата с отдыха — должен быть 0, но проверим).
+    """
+    if _account_manager is None:
+        return
+    while _account_manager.quota_exhausted():
+        idx = _account_manager.current_index
+        used = _account_manager.search_counts[idx]
+        print(
+            f"📉 Аккаунт #{idx + 1} исчерпал квоту поисков "
+            f"({used}/{MAX_SEARCHES_PER_ACCOUNT}). Ротация."
+        )
+        rotate_fn()
+
+
 def x_search_people(x_page_ref, query, rotate_fn):
     """
     Открывает x.com/search?q=<query>&f=user, возвращает список handle'ов
     в порядке появления (только видимые People-карточки).
     """
+    ensure_search_quota(rotate_fn)
     q = quote(query)
     url = f"https://x.com/search?q={q}&src=typed_query&f=user"
-    print(f"🔎 X поиск (people): {query}")
+
+    if _account_manager is not None:
+        used_before = _account_manager.note_search()
+        acc_idx = _account_manager.current_index
+        print(
+            f"🔎 X поиск (people) [acc #{acc_idx + 1} "
+            f"{used_before}/{MAX_SEARCHES_PER_ACCOUNT}]: {query}"
+        )
+    else:
+        print(f"🔎 X поиск (people): {query}")
 
     goto_x_page_with_retry(x_page_ref, url, rotate_fn, label=f"search:{query}")
     x_page = x_page_ref[0]
@@ -1032,9 +1086,19 @@ def x_search_top_latest(x_page_ref, query, rotate_fn):
     Открывает x.com/search?q=<query>&f=top — берёт автора первого видимого твита.
     Используется как fallback для поиска по кошельку.
     """
+    ensure_search_quota(rotate_fn)
     q = quote(query)
     url = f"https://x.com/search?q={q}&src=typed_query"
-    print(f"🔎 X поиск (top): {query}")
+
+    if _account_manager is not None:
+        used_before = _account_manager.note_search()
+        acc_idx = _account_manager.current_index
+        print(
+            f"🔎 X поиск (top) [acc #{acc_idx + 1} "
+            f"{used_before}/{MAX_SEARCHES_PER_ACCOUNT}]: {query}"
+        )
+    else:
+        print(f"🔎 X поиск (top): {query}")
 
     goto_x_page_with_retry(x_page_ref, url, rotate_fn, label=f"search_top:{query}")
     x_page = x_page_ref[0]
@@ -1463,9 +1527,11 @@ def process_collection(
 # ==================== MAIN ====================
 
 def main():
+    global _account_manager
     txt_path, csv_path = get_output_paths()
     accounts = load_all_accounts()
     account_manager = AccountManager(accounts)
+    _account_manager = account_manager
 
     processed_owners = load_set_from_file(PROCESSED_OWNERS_FILE)
     processed_collections = load_set_from_file(PROCESSED_COLLECTIONS_FILE)
@@ -1477,6 +1543,7 @@ def main():
     print(f"OpenSea via CDP: {OPENSEA_CDP_URL}")
     print(f"X proxy: {PROXY_SERVER} (enabled={PROXY_ENABLED})")
     print(f"Аккаунтов X: {account_manager.total()}")
+    print(f"Лимит поисков на аккаунт: {MAX_SEARCHES_PER_ACCOUNT}")
     print(f"Already processed owners: {len(processed_owners)}")
     print(f"Already processed collections: {len(processed_collections)}")
     print(f"Already saved twitter handles: {len(processed_twitter)}")

@@ -984,32 +984,110 @@ def open_owner_and_get_details(opensea_page, owner_url):
             twitter_handle = handle
             break
 
-    # wallet: если opensea_id это кошелёк — уже есть, иначе ищем на странице
+    # wallet: если opensea_id это кошелёк — уже есть.
+    # Иначе кликаем по кнопке "PUBLIC WALLET" и достаём 0x... ТОЛЬКО из её dropdown.
     wallet = opensea_id if is_wallet(opensea_id) else ""
 
     if not wallet:
-        try:
-            # Источники: hrefs (etherscan/blockscan), aria-label, текст body
-            page_data = opensea_page.evaluate(
-                """
-                () => {
-                    const parts = [];
-                    const anchors = Array.from(document.querySelectorAll('a[href]'));
-                    for (const a of anchors) parts.push(a.getAttribute('href') || '');
-                    const ariaEls = Array.from(document.querySelectorAll('[aria-label]'));
-                    for (const e of ariaEls) parts.push(e.getAttribute('aria-label') || '');
-                    parts.push(document.body.innerText || '');
-                    return parts.join(' ');
-                }
-                """
-            )
-        except Exception:
-            page_data = ""
-        m = re.search(r"0x[a-fA-F0-9]{40}", page_data or "")
-        if m:
-            wallet = m.group(0).lower()
+        wallet = extract_wallet_from_public_wallet_dropdown(opensea_page)
 
     return twitter_handle, opensea_id, wallet
+
+
+def extract_wallet_from_public_wallet_dropdown(opensea_page):
+    """
+    Находит кнопку с текстом 'PUBLIC WALLET' на opensea профиле,
+    кликает её, и берёт ПОЛНЫЙ 0x... ровно из развернувшегося dropdown.
+    Никаких регулярок по всей странице, чтобы не подцепить случайные адреса
+    (контракты, etherscan-ссылки на других людей, и т.п.).
+    """
+    try:
+        clicked = opensea_page.evaluate(
+            """
+            () => {
+                const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                const target = btns.find(b => {
+                    const t = (b.innerText || '').trim().toUpperCase();
+                    return /\\bPUBLIC\\s+WALLET\\b/.test(t);
+                });
+                if (!target) return false;
+                target.scrollIntoView({block: 'center'});
+                target.click();
+                return true;
+            }
+            """
+        )
+    except Exception:
+        clicked = False
+
+    if not clicked:
+        return ""
+
+    sleep_random(0.6, 1.2)
+
+    try:
+        candidate = opensea_page.evaluate(
+            """
+            () => {
+                const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                const target = btns.find(b => {
+                    const t = (b.innerText || '').trim().toUpperCase();
+                    return /\\bPUBLIC\\s+WALLET\\b/.test(t);
+                });
+                if (!target) return '';
+
+                const FULL = /0x[a-fA-F0-9]{40}/;
+
+                const collect = (el) => {
+                    if (!el) return '';
+                    const parts = [];
+                    parts.push(el.innerText || '');
+                    parts.push(el.textContent || '');
+                    parts.push(el.getAttribute('title') || '');
+                    parts.push(el.getAttribute('aria-label') || '');
+                    for (const attr of el.getAttributeNames ? el.getAttributeNames() : []) {
+                        if (attr.startsWith('data-')) parts.push(el.getAttribute(attr) || '');
+                    }
+                    for (const a of el.querySelectorAll('a[href]')) parts.push(a.getAttribute('href') || '');
+                    for (const node of el.querySelectorAll('[title]')) parts.push(node.getAttribute('title') || '');
+                    for (const node of el.querySelectorAll('[aria-label]')) parts.push(node.getAttribute('aria-label') || '');
+                    for (const node of el.querySelectorAll('[data-clipboard-text]')) parts.push(node.getAttribute('data-clipboard-text') || '');
+                    return parts.join(' ');
+                };
+
+                // Зона поиска: контейнер вокруг кнопки (родитель и его сиблинги),
+                // плюс aria-controls/aria-owns если они указывают на конкретный popover.
+                const zones = [];
+                const ariaIds = [];
+                for (const attr of ['aria-controls', 'aria-owns']) {
+                    const v = target.getAttribute(attr);
+                    if (v) v.split(/\\s+/).forEach(id => ariaIds.push(id));
+                }
+                for (const id of ariaIds) {
+                    const node = document.getElementById(id);
+                    if (node) zones.push(node);
+                }
+                zones.push(target);
+                if (target.parentElement) zones.push(target.parentElement);
+                if (target.parentElement && target.parentElement.parentElement) {
+                    zones.push(target.parentElement.parentElement);
+                }
+
+                for (const z of zones) {
+                    const blob = collect(z);
+                    const m = blob.match(FULL);
+                    if (m) return m[0];
+                }
+                return '';
+            }
+            """
+        )
+    except Exception:
+        candidate = ""
+
+    if candidate and re.fullmatch(r"0x[a-fA-F0-9]{40}", candidate):
+        return candidate.lower()
+    return ""
 
 
 # ==================== X PAGE LOAD WITH RETRY ====================
